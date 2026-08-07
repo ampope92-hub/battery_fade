@@ -24,9 +24,6 @@ RUN apt-get update \
 COPY --from=rust /usr/local/cargo /usr/local/cargo
 COPY --from=rust /usr/local/rustup /usr/local/rustup
 
-COPY requirements.lock /tmp/requirements.lock
-RUN python -m pip install --require-hashes --no-deps --no-cache-dir -r /tmp/requirements.lock
-
 # The database export the model is built from, and the Cargo project that consumes it.
 COPY data /app/data
 COPY predictor /app/predictor
@@ -37,6 +34,6 @@ COPY predictor /app/predictor
 RUN cd /app/predictor \
     && CARGO_NET_OFFLINE=false cargo fetch --locked \
     && cargo build --release --offline \
-    && rm -f /app/predictor/target/release/fleet_predictor
+    && rm -f /app/predictor/target/release/pack_predictor
 
 WORKDIR /app

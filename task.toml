@@ -1,38 +1,86 @@
-# Task configuration schema version
-version = "2.0"
-
-# Task metadata (author, difficulty, categorization)
-[metadata]
+name = "battery-fade"
+category = "ML"
+subcategory = "Training"
+tags = ["rust", "smartcore", "cargo", "regression", "extrapolation"]
+languages = ["rust"]
+difficulty = "advanced"
+expert_time_estimate_hours = 10
 author_name = "anonymous"
 author_email = "anonymous"
-difficulty = "hard"
-category = "machine-learning"
-# Options for subcategories are: "long_context", "tool_specific", "api_integration", "db_interaction", "ui_building"
-subcategories = [ "tool_specific",]
-# The number of milestones in the task (can be zero if not a milestone task)
-number_of_milestones = 0
-# Size of the codebase: minimal -> 0-20 files, small -> 20+ files, large -> 200+ files
-codebase_size = "minimal"
-# Coding languages used in the oracle solution or required by the agent
-languages = [ "rust", "bash",]
-# For tool_specific, api_integration, and db_interaction subcategories, please include specific tool, api framework, or database software
-tags = [ "rust", "smartcore", "cargo", "tabular", "regression", "extrapolation", "machine-learning",]
-# Estimated time to complete (minutes)
-expert_time_estimate_min = 75
-junior_time_estimate_min = 200
 
-# Verifier: runs the test script to check task completion
+difficulty_explanation = """
+Every pack in the field export has more cycles than any pack in the teardown cohort —
+50-600 in training, 850-1700 to be scored. Anything that partitions feature space cannot
+leave the range it was fitted on, so gradient boosting, random forests and KNN all flatten
+out at the training boundary and score negative R2 no matter how they are tuned; tuning
+harder makes them worse, and in-range cross-validation never shows it. Recognizing that is
+necessary but not sufficient. Capacity fade is diffusion-limited, falling with the square
+root of cycles, so a straight linear fit picks up the average slope over 50-600 — much
+steeper than the real slope out at 1200 — and keeps under-calling capacity on old packs,
+landing at R2 -0.19. The stress drivers scale the fade rather than shifting it, so they
+have to enter multiplied by the cycle term. Sqrt without those interactions reaches only
+0.75. The work also happens in smartcore on an offline box with no Python data stack, so
+scikit-learn habits do not transfer.
+
+Calibrated across 6 generator seeds: the best available wrong answer is 0.8217 and the
+weakest correct route is 0.9242, with the bar at 0.88 sitting between them. Three
+independent routes clear it, so the task is not a single-path puzzle.
+"""
+
+solution_explanation = """
+The reference (solution/solve.sh) writes src/main.rs and runs the Cargo project. It
+regresses capacity on sqrt(cycles) together with the stress drivers and, critically, those
+drivers multiplied by sqrt(cycles) — chemistry, temperature, depth of discharge and
+fast-charge share each scaling the fade rate — using smartcore's LinearRegression, and
+clamps output to 0-100. It scores 0.9827 against the bench results with the bar at 0.88.
+"""
+
+verification_explanation = """
+The verifier runs in its own container. It collects the agent's crate sources
+(/app/predictor/src, Cargo.toml, Cargo.lock) and the shipped export (/app/data) as
+artifacts, drops them onto a prepared skeleton whose dependency tree is already compiled,
+and runs cargo build/run --release --offline itself. The graded predictions.csv is
+therefore always the output of a clean build of the agent's own code — a hand-written
+predictions file never reaches the grader, and a crate that only compiles because of local
+state does not survive.
+
+tests/test_outputs.py then runs six checks: the shipped export is unaltered (sha256), the
+schema is exactly pack_id,capacity_pct, coverage of the field packs is one-to-one, values
+are numeric and within 0-100, predictions are a real spread rather than a constant, and R2
+against tests/golden/test_labels.csv reaches 0.88. The golden labels live in the verifier
+image and are never present in the agent environment, so hardcoding is impossible by
+construction. Only pytest is installed, so the CSV reading and the R2 come from the
+standard library.
+"""
+
+relevant_experience = """
+I build and calibrate predictive-maintenance and reliability models on tabular fleet data,
+which is where this task's failure mode comes from: a model that validates well in-range
+and then collapses on equipment that has aged past anything in the training set. Calibrating
+this task meant sweeping five model families across six generated seeds to establish what
+the best available wrong answer actually scores, including blends and tuned variants, so the
+threshold separates a correct method from a lucky one rather than separating effort levels.
+I also ported the whole harness to Rust/smartcore, which required rebuilding by hand the
+pieces the Python ecosystem gives away for free.
+"""
+
+artifacts = [
+    "/app/predictor/src/",
+    "/app/predictor/Cargo.toml",
+    "/app/predictor/Cargo.lock",
+    "/app/data/",
+]
+
 [verifier]
-timeout_sec = 600.0
+timeout_sec = 600
+environment_mode = "separate"
 
-# Agent: limits how long the agent can run when attempting the task
 [agent]
-timeout_sec = 1800.0
+timeout_sec = 3600
 
-# Sandbox environment limits
 [environment]
-allow_internet = false
-build_timeout_sec = 900.0
+network_mode = "no-network"
+build_timeout_sec = 900
 cpus = 2
 memory_mb = 6144
-storage_mb = 12288
+storage_mb = 10240

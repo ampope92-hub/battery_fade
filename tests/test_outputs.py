@@ -70,11 +70,13 @@ def _r2(pred, truth):
 
 
 def test_shipped_data_unmodified():
+    """The shipped train.csv and test_features.csv are byte-for-byte as issued."""
     assert _sha(TEST_FEATURES) == TEST_FEATURES_SHA, "test_features.csv was altered"
     assert _sha(pathlib.Path("/app/data/train.csv")) == TRAIN_SHA, "train.csv was altered"
 
 
 def test_schema(preds):
+    """predictions.csv carries exactly the two columns pack_id and capacity_pct."""
     header, _ = preds
     assert header == ["pack_id", "capacity_pct"], (
         f"predictions.csv must have exactly columns pack_id,capacity_pct, got {header}"
@@ -82,6 +84,7 @@ def test_schema(preds):
 
 
 def test_covers_every_pack_exactly_once(preds, labels):
+    """Every field pack has exactly one row — no duplicates, omissions or unknown ids."""
     _, rows = preds
     ids = [row[0] for row in rows]
     assert len(ids) == len(set(ids)), "duplicate pack_id entries"
@@ -92,6 +95,7 @@ def test_covers_every_pack_exactly_once(preds, labels):
 
 
 def test_capacities_valid(preds):
+    """Each capacity_pct is a finite number inside the physical 0-100 range."""
     _, rows = preds
     for row in rows:
         try:
@@ -105,6 +109,7 @@ def test_capacities_valid(preds):
 
 
 def test_predictions_not_degenerate(preds):
+    """Predictions differ across packs rather than being one repeated constant."""
     v = _values(preds)
     assert len(set(v)) >= 50, "predictions are (near-)constant — not a real model"
     mean = sum(v) / len(v)
@@ -113,6 +118,7 @@ def test_predictions_not_degenerate(preds):
 
 
 def test_r2_bar(preds, labels):
+    """R2 against the withheld bench results reaches the 0.88 the task requires."""
     _, rows = preds
     pred = [float(row[1]) for row in rows]
     truth = [labels[row[0]] for row in rows]

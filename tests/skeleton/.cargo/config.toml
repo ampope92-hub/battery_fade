@@ -1,0 +1,9 @@
+# The box has no network. Every dependency is already vendored in the image's cargo
+# registry, so builds resolve offline; adding a new crate will not work here.
+[net]
+offline = true
+
+# Prefer dependency versions compatible with this crate's rust-version (rustc 1.85),
+# so resolution doesn't pull in crates that need a newer toolchain.
+[resolver]
+incompatible-rust-versions = "fallback"
