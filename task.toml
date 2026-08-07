@@ -54,14 +54,16 @@ standard library.
 """
 
 relevant_experience = """
-I build and calibrate predictive-maintenance and reliability models on tabular fleet data,
-which is where this task's failure mode comes from: a model that validates well in-range
-and then collapses on equipment that has aged past anything in the training set. Calibrating
-this task meant sweeping five model families across six generated seeds to establish what
-the best available wrong answer actually scores, including blends and tuned variants, so the
-threshold separates a correct method from a lucky one rather than separating effort levels.
-I also ported the whole harness to Rust/smartcore, which required rebuilding by hand the
-pieces the Python ecosystem gives away for free.
+I authored the fleet predictive-maintenance task that was accepted into the previous benchmark
+edition, and this one is built on the harness and the calibration method I developed for it.
+That method is the part I would point at: grant every wrong approach its best possible
+adversary — tuned variants, blends, aggregate features — sweep them across several generated
+seeds, and only then place the threshold between the strongest wrong answer and the weakest
+correct one. Here that meant establishing that a half-and-half linear and boosted blend is the
+best a wrong method can do at 0.8217, which is well above the naive routes and would have
+quietly broken the task had I not swept for it. I also built the Rust/smartcore side of the
+harness, including the parts of that library that behave differently from their Python
+equivalents and have to be worked around by hand.
 """
 
 artifacts = [
