@@ -1,4 +1,15 @@
 name = "battery-fade"
+
+# The verifier reads only these paths from the agent's final environment. Must stay
+# top-level: nested under [verifier] the value is silently dropped.
+artifacts = [
+    "/app/predictor/src/",
+    "/app/predictor/Cargo.toml",
+    "/app/predictor/Cargo.lock",
+    "/app/data/",
+]
+
+[metadata]
 category = "ML"
 subcategory = "Training"
 tags = ["rust", "smartcore", "cargo", "regression", "extrapolation"]
@@ -66,15 +77,8 @@ harness, including the parts of that library that behave differently from their 
 equivalents and have to be worked around by hand.
 """
 
-artifacts = [
-    "/app/predictor/src/",
-    "/app/predictor/Cargo.toml",
-    "/app/predictor/Cargo.lock",
-    "/app/data/",
-]
-
 [verifier]
-timeout_sec = 600
+timeout_sec = 1800
 environment_mode = "separate"
 
 [agent]
