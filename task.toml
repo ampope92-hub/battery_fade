@@ -36,6 +36,14 @@ scikit-learn habits do not transfer.
 Calibrated across 6 generator seeds: the best available wrong answer is 0.8217 and the
 weakest correct route is 0.9242, with the bar at 0.88 sitting between them. Three
 independent routes clear it, so the task is not a single-path puzzle.
+
+The data is synthetic, generated from a diffusion-limited fade model with per-pack noise,
+but the shape it reproduces is the one that makes this hard in practice: a teardown cohort
+is small, expensive and biased towards packs pulled early, so it never spans the cycle
+range of the fleet still running. Battery and reliability analytics engineers at
+fleet-leasing operators and second-life battery firms do exactly this — size a replacement
+schedule from a thin bench-tested cohort — and the extrapolation gap is the standing
+hazard in that job, not an artefact of the generator.
 """
 
 solution_explanation = """

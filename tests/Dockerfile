@@ -37,9 +37,18 @@ RUN useradd --create-home --uid 10001 --shell /bin/bash runner
 # only the crate's own sources to recompile. Keep this in sync with
 # environment/predictor/Cargo.{toml,lock}.
 COPY skeleton /app/predictor
+# The prebuilt skeleton binary must NOT survive into the image. `rm -rf src` alone leaves
+# target/release/{pkg} and its fingerprint behind, and cargo decides freshness by mtime:
+# when Harbor uploads the agent's sources with an mtime older than this layer, cargo skips
+# the rebuild ("Finished" with no "Compiling"), runs the stale `fn main() {}` binary, and
+# nothing is written — the graded output stops coming from the agent's code at all. That is
+# a silent failure: it looks like the agent produced nothing. `cargo clean -p` drops just
+# this crate's artifacts and keeps the compiled dependency tree, which is the whole point
+# of the skeleton.
 RUN cd /app/predictor \
     && CARGO_NET_OFFLINE=false cargo fetch --locked \
     && cargo build --release --offline \
+    && cargo clean --release -p pack_predictor \
     && rm -rf /app/predictor/src
 
 # Artifact landing directories must exist before Harbor uploads the declared artifacts.
