@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reference model for the pack capacity bar.
+# Reference solution for battery_fade.
 #
-# Two things decide this one. First, every field pack has more cycles than any
-# pack in the teardown cohort (50-600 there, 850-1700 in the field), so anything
-# that splits feature space — trees, forests, KNN — is stuck predicting the
-# capacities it saw and flattens out at the edge of the training range. It has to
-# be a model that extrapolates.
+# Two separate things have to be right here.
 #
-# Second, fade is diffusion-limited: capacity falls with the square root of
-# cycles, not linearly. Regressing on raw cycles picks up the average slope over
-# 50-600, which is far steeper than the real slope out at 1200, so it keeps
-# under-calling capacity on the old packs. Put sqrt(cycles) in instead.
+# The cycle ranges don't overlap: 50-600 in the teardown cohort, 850-1700 out in
+# the field. Trees, forests and KNN all partition the feature space, so past the
+# edge of the training range they just repeat the nearest capacity they saw and
+# go flat. Only a model that extrapolates is any use.
 #
-# The stress drivers scale the fade rather than shifting it — a hot pack on deep
-# discharge loses more capacity *per cycle* — so they go in multiplied by
-# sqrt(cycles) as well. Without those interaction terms the fit lands around 0.75
-# and misses the bar.
+# And the fade is diffusion-limited, so capacity goes with sqrt(cycles) rather
+# than cycles. Fit on raw cycles and you pick up the average slope over 50-600,
+# much steeper than the real slope out at 1200, so the old packs keep coming out
+# too low. Feed it sqrt(cycles) instead.
+#
+# The stress drivers scale the fade rather than shifting it (a hot pack on deep
+# discharge loses more capacity per cycle), so they go in multiplied by
+# sqrt(cycles) too. Without those interactions this lands about 0.75 and misses.
 
 cat > /app/predictor/src/main.rs <<'RUST'
 use std::error::Error;

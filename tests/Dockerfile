@@ -26,6 +26,11 @@ COPY --from=rust /usr/local/rustup /usr/local/rustup
 # Verifier tooling, pinned. Nothing is installed at trial time.
 RUN pip install --no-cache-dir pytest==8.4.1 pytest-json-ctrf==0.3.5
 
+# test.sh rebuilds and runs the agent's crate, so agent-authored code executes in this
+# image — and this image holds the answer key. That code runs as `runner`, never root:
+# runner owns the crate and the cargo cache and nothing else.
+RUN useradd --create-home --uid 10001 --shell /bin/bash runner
+
 # The crate skeleton mirrors environment/predictor's manifest so the dependency tree can
 # be fetched and compiled now, while the build still has a network. The agent's own
 # src/, Cargo.toml and Cargo.lock arrive later as artifacts and overwrite these, leaving
@@ -39,6 +44,19 @@ RUN cd /app/predictor \
 
 # Artifact landing directories must exist before Harbor uploads the declared artifacts.
 RUN mkdir -p /app/predictor/src /app/data
+
+# Building as `runner` means cargo writes target/ and the CARGO_HOME package-cache lock;
+# neither holds anything secret. /app is runner-owned so the crate can create
+# /app/predictions.csv, but sticky so runner cannot rename or delete the root-owned
+# export it sits beside.
+RUN chown -R runner:runner /app /usr/local/cargo \
+    && chmod 1755 /app
+
+# The graded answer key, at a path Harbor does not reserve, readable only by root. /tests is
+# a runtime mount — permissions set on it here are both ineffective and a documented cause of
+# verifier failure — so the labels cannot be protected there. test_outputs.py reads this copy.
+COPY golden /opt/golden
+RUN chmod 700 /opt/golden && chmod 600 /opt/golden/*
 
 COPY . /tests/
 

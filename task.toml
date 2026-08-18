@@ -55,13 +55,26 @@ therefore always the output of a clean build of the agent's own code — a hand-
 predictions file never reaches the grader, and a crate that only compiles because of local
 state does not survive.
 
+Rebuilding the agent's crate means the verifier executes code the agent wrote, so that step
+is the one thing it does not do as root: test.sh hands the crate to an unprivileged user and
+runs the build under it. The graded answer key is baked into the verifier image at
+/opt/golden, readable only by root. Harbor owns the /tests and /logs mounts at runtime, so
+permissions cannot be enforced there and this verifier deliberately leaves them alone; the
+plaintext copy of the labels that arrives under /tests is closed to the unprivileged user on
+a best-effort basis, and whether that succeeded is logged rather than allowed to fail the
+run. Root alone runs pytest and decides the reward from its exit status, and the shipped
+export is left read-only to the build user. Verified by four cheat arms — crates that read
+either copy of the labels, one that overwrites test_outputs.py, one that writes reward.txt
+directly — each of which compiles and then fails on permissions, scoring 0.
+
 tests/test_outputs.py then runs six checks: the shipped export is unaltered (sha256), the
 schema is exactly pack_id,capacity_pct, coverage of the field packs is one-to-one, values
 are numeric and within 0-100, predictions are a real spread rather than a constant, and R2
-against tests/golden/test_labels.csv reaches 0.88. The golden labels live in the verifier
-image and are never present in the agent environment, so hardcoding is impossible by
-construction. Only pytest is installed, so the CSV reading and the R2 come from the
-standard library.
+against tests/golden/test_labels.csv reaches 0.88. That bar sits between the strongest wrong
+approach and the weakest correct one, both established by sweeping each route across six
+generator seeds: the best a wrong method achieves is 0.8217 (a tuned linear/boosted blend)
+and the weakest passing route is 0.9242, with the threshold frozen against the tightest seed.
+Only pytest is installed, so the CSV reading and the R2 come from the standard library.
 """
 
 relevant_experience = """
