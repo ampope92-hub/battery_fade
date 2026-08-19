@@ -14,7 +14,7 @@ category = "ML"
 subcategory = "Training"
 tags = ["rust", "smartcore", "cargo", "regression", "extrapolation"]
 languages = ["rust"]
-difficulty = "advanced"
+difficulty = "core"
 expert_time_estimate_hours = 10
 author_name = "anonymous"
 author_email = "anonymous"
@@ -35,7 +35,11 @@ scikit-learn habits do not transfer.
 
 Calibrated across 6 generator seeds: the best available wrong answer is 0.8217 and the
 weakest correct route is 0.9242, with the bar at 0.88 sitting between them. Three
-independent routes clear it, so the task is not a single-path puzzle.
+independent routes clear it, so the task is not a single-path puzzle. Those numbers do not have to be
+taken on trust: solution/generate_data.py regenerates the shipped CSVs (seed 0, verified
+byte-identical by sha256) and solution/calibrate.py scores every route against the held-out
+packs, so a reviewer can reproduce the separation directly. Both sit in solution/, which is
+absent from the agent image, so shipping them cannot leak the labels.
 
 The data is synthetic, generated from a diffusion-limited fade model with per-pack noise,
 but the shape it reproduces is the one that makes this hard in practice: a teardown cohort
