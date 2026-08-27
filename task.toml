@@ -34,7 +34,9 @@ have to enter multiplied by the cycle term. Sqrt without those interactions reac
 scikit-learn habits do not transfer.
 
 Calibrated across 6 generator seeds: the best available wrong answer is 0.8217 and the
-weakest correct route is 0.9242, with the bar at 0.88 sitting between them. Three
+weakest correct route is 0.9242, with the bar at 0.88 sitting between them. A second
+bar of 0.87 applies to the highest-cycle quarter alone, where the same three routes score
+0.9790, 0.9790 and 0.8873 against 0.7647 for the best wrong one. Three
 independent routes clear it, so the task is not a single-path puzzle. Those numbers do not have to be
 taken on trust: solution/generate_data.py regenerates the shipped CSVs (seed 0, verified
 byte-identical by sha256) and solution/calibrate.py scores every route against the held-out
@@ -55,7 +57,8 @@ The reference (solution/solve.sh) writes src/main.rs and runs the Cargo project.
 regresses capacity on sqrt(cycles) together with the stress drivers and, critically, those
 drivers multiplied by sqrt(cycles) — chemistry, temperature, depth of discharge and
 fast-charge share each scaling the fade rate — using smartcore's LinearRegression, and
-clamps output to 0-100. It scores 0.9827 against the bench results with the bar at 0.88.
+clamps output to 0-100. It scores 0.9827 against the bench results with the bar at 0.88, and 0.9790 on the
+highest-cycle quarter against that band's bar of 0.87.
 """
 
 verification_explanation = """
@@ -68,24 +71,42 @@ predictions file never reaches the grader, and a crate that only compiles becaus
 state does not survive.
 
 Rebuilding the agent's crate means the verifier executes code the agent wrote, so that step
-is the one thing it does not do as root: test.sh hands the crate to an unprivileged user and
-runs the build under it. The graded answer key is baked into the verifier image at
-/opt/golden, readable only by root. Harbor owns the /tests and /logs mounts at runtime, so
-permissions cannot be enforced there and this verifier deliberately leaves them alone; the
-plaintext copy of the labels that arrives under /tests is closed to the unprivileged user on
-a best-effort basis, and whether that succeeded is logged rather than allowed to fail the
-run. Root alone runs pytest and decides the reward from its exit status, and the shipped
-export is left read-only to the build user. Verified by four cheat arms — crates that read
-either copy of the labels, one that overwrites test_outputs.py, one that writes reward.txt
-directly — each of which compiles and then fails on permissions, scoring 0.
+is the one thing it does not do as root. test.sh hands the crate to an unprivileged build
+user and runs it through setpriv with supplementary groups cleared and no-new-privileges
+set, so neither an inherited group nor a setuid binary can widen what that code reaches.
+The graded answer key is baked into the image at /opt/golden, readable only by root. The
+whole /tests mount — the verifier's own code as well as the plaintext label copy that
+arrives there — is closed to the build user before anything untrusted starts, and if it is
+still reachable the run is abandoned with reward 0 rather than graded: a reachable /tests is
+one the agent can read the answers out of, or whose test file it can rewrite before pytest
+reads it. The build runs in its own session, and its entire process group is torn down, then
+every process the build user still owns is swept, before pytest runs and before the reward
+is written — so nothing the agent started is alive during grading and no double-forked child
+can rewrite the reward after it is computed. /logs is left to Harbor, which owns it; the
+reward is simply written there last, once nothing hostile is running. Root alone runs pytest
+and decides the reward from its exit status, and the shipped export is left read-only to the
+build user. Verified by cheat arms — crates that read either copy of the labels, one that
+overwrites test_outputs.py, one that writes reward.txt directly — each of which compiles and
+then fails on permissions, scoring 0.
 
-tests/test_outputs.py then runs six checks: the shipped export is unaltered (sha256), the
+tests/test_outputs.py then runs seven checks: the shipped export is unaltered (sha256), the
 schema is exactly pack_id,capacity_pct, coverage of the field packs is one-to-one, values
-are numeric and within 0-100, predictions are a real spread rather than a constant, and R2
-against tests/golden/test_labels.csv reaches 0.88. That bar sits between the strongest wrong
-approach and the weakest correct one, both established by sweeping each route across six
+are numeric and within 0-100, predictions are a real spread rather than a constant, R2
+against tests/golden/test_labels.csv reaches 0.88, and that same R2 recomputed over only the
+highest-cycle quarter of the batch reaches 0.87. That first bar sits between the strongest
+wrong approach and the weakest correct one, both established by sweeping each route across six
 generator seeds: the best a wrong method achieves is 0.8217 (a tuned linear/boosted blend)
 and the weakest passing route is 0.9242, with the threshold frozen against the tightest seed.
+
+The high-cycle bar exists because an aggregate R2 is dominated by the field packs nearest the
+training range, so a fade curve with the wrong exponent can drift badly at 1700 cycles and
+still post a respectable overall number. The band is the 450 field packs with the most cycles
+(1474-1700), fixed by sorting on (cycles, pack_id) so the split cannot shift between runs, and
+membership is derived from the shipped export after re-checking its sha256 rather than from
+anything the agent's crate can steer. On the shipped seed the same three routes clear both
+bars - sqrt-with-interactions 0.9790, the high-cycle-half refit 0.9790, and the log-fade route
+0.8873 - while the strongest wrong route reaches only 0.7647, so the second bar narrows the
+gap without closing off any route the first one admits.
 Only pytest is installed, so the CSV reading and the R2 come from the standard library.
 """
 
@@ -103,14 +124,24 @@ equivalents and have to be worked around by hand.
 """
 
 [verifier]
+# Nothing is fetched at grade time; every verifier dependency is baked into
+# tests/Dockerfile, so the grading phase stays offline.
+network_mode = "no-network"
 timeout_sec = 1800
 environment_mode = "separate"
 
 [agent]
+# Solved offline by design: the crates are pre-fetched and pinned in Cargo.lock, and
+# network access would let the agent fetch a survival/ML library instead of
+# implementing the fit, which is the work being measured.
+network_mode = "no-network"
 timeout_sec = 3600
 
 [environment]
-network_mode = "no-network"
+# Required "public" on every task, offline ones included: the image is built and the
+# agent harness installed during this phase and that install needs the network. It says
+# nothing about the agent or the verifier, both of which are closed below/above.
+network_mode = "public"
 build_timeout_sec = 900
 cpus = 2
 memory_mb = 6144

@@ -6,7 +6,9 @@ clean release build. We check that the file exists, its schema, that it covers e
 field pack exactly once, that the values are numeric and physically plausible, that
 the predictions are a real spread rather than a constant, that the shipped export was
 not edited, and that the R2 against the bench results in /opt/golden/test_labels.csv
-(never present in the agent environment) reaches the 0.88 stated in the task.
+(never present in the agent environment) reaches the 0.88 stated in the task, and that it
+still reaches 0.87 on the highest-cycle quarter of the batch, where a fade curve with the
+wrong exponent drifts off even when the aggregate score looks fine.
 
 Only pytest is installed, so the CSV reading and the R2 come from the standard library
 rather than pandas/scikit-learn.
@@ -25,6 +27,12 @@ PRED_PATH = pathlib.Path("/app/predictions.csv")
 LABELS_PATH = pathlib.Path("/opt/golden/test_labels.csv")
 TEST_FEATURES = pathlib.Path("/app/data/test_features.csv")
 R2_BAR = 0.88
+# The same R2, recomputed over only the quarter of the field packs with the highest cycle
+# counts. An aggregate score is dominated by the packs nearest the training range, so a fade
+# curve with the wrong exponent can miss badly at 1700 cycles and still post a high overall
+# number; this is the end of the extrapolation the fleet actually gets scheduled from.
+HIGH_CYCLE_R2_BAR = 0.87
+HIGH_CYCLE_FRACTION = 0.25
 
 # frozen at task-build time; the shipped export must not be altered
 TEST_FEATURES_SHA = "fa38f3e37481e9f432d486a9f35dbcf704f7245bab018c9d049b4e989dc802bd"
@@ -119,6 +127,23 @@ def test_predictions_not_degenerate(preds):
     assert sd > 0.5, "predictions carry almost no variation"
 
 
+@pytest.fixture(scope="session")
+def high_cycle_ids():
+    """The highest-cycle quarter of the field packs, by cycle count.
+
+    Cycle counts come from the shipped export, so this re-checks its sha256 rather than
+    relying on test_shipped_data_unmodified having run first — the crate is rebuilt and run
+    in this container, and which packs land in the band must not be something it can steer.
+    Ordering breaks ties on pack_id so the split is identical on every run.
+    """
+    assert _sha(TEST_FEATURES) == TEST_FEATURES_SHA, "test_features.csv was altered"
+    header, rows = _read_csv(TEST_FEATURES)
+    i_id, i_cyc = header.index("pack_id"), header.index("cycles")
+    ordered = sorted(rows, key=lambda r: (float(r[i_cyc]), r[i_id]))
+    cut = len(ordered) - int(len(ordered) * HIGH_CYCLE_FRACTION)
+    return {r[i_id] for r in ordered[cut:]}
+
+
 def test_r2_bar(preds, labels):
     """R2 against the withheld bench results reaches the 0.88 the task requires."""
     _, rows = preds
@@ -128,4 +153,19 @@ def test_r2_bar(preds, labels):
     assert r2 >= R2_BAR, (
         f"R2 against the bench results is {r2:.4f}, below the required {R2_BAR:.2f} — "
         f"the model does not carry to the field packs"
+    )
+
+
+def test_r2_high_cycle_bar(preds, labels, high_cycle_ids):
+    """R2 holds up on the highest-cycle quarter, not just averaged over the whole batch."""
+    _, rows = preds
+    band = [row for row in rows if row[0] in high_cycle_ids]
+    assert len(band) == len(high_cycle_ids), "high-cycle packs missing from predictions.csv"
+    pred = [float(row[1]) for row in band]
+    truth = [labels[row[0]] for row in band]
+    r2 = _r2(pred, truth)
+    assert r2 >= HIGH_CYCLE_R2_BAR, (
+        f"R2 on the highest-cycle quarter of the batch is {r2:.4f}, below the required "
+        f"{HIGH_CYCLE_R2_BAR:.2f} — the fade curve drifts off at the high-cycle end even "
+        f"though the overall score looks acceptable"
     )
