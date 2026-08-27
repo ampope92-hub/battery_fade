@@ -12,53 +12,67 @@ artifacts = [
 [metadata]
 category = "ML"
 subcategory = "Training"
-tags = ["rust", "smartcore", "cargo", "regression", "extrapolation"]
+tags = ["rust", "smartcore", "cargo", "regression", "heteroscedasticity", "decision-threshold"]
 languages = ["rust"]
-difficulty = "core"
+difficulty = "advanced"
 expert_time_estimate_hours = 10
 author_name = "anonymous"
 author_email = "anonymous"
 
 difficulty_explanation = """
-Every pack in the field export has more cycles than any pack in the teardown cohort —
-50-600 in training, 850-1700 to be scored. Anything that partitions feature space cannot
-leave the range it was fitted on, so gradient boosting, random forests and KNN all flatten
-out at the training boundary and score negative R2 no matter how they are tuned; tuning
-harder makes them worse, and in-range cross-validation never shows it. Recognizing that is
-necessary but not sufficient. Capacity fade is diffusion-limited, falling with the square
-root of cycles, so a straight linear fit picks up the average slope over 50-600 — much
-steeper than the real slope out at 1200 — and keeps under-calling capacity on old packs,
-landing at R2 -0.19. The stress drivers scale the fade rather than shifting it, so they
-have to enter multiplied by the cycle term. Sqrt without those interactions reaches only
-0.75. The work also happens in smartcore on an offline box with no Python data stack, so
-scikit-learn habits do not transfer.
+Two numbers are graded per pack and they fail for different reasons, which is what makes
+this more than a regression exercise.
 
-Calibrated across 6 generator seeds: the best available wrong answer is 0.8217 and the
-weakest correct route is 0.9242, with the bar at 0.88 sitting between them. A second
-bar of 0.87 applies to the highest-cycle quarter alone, where the same three routes score
-0.9790, 0.9790 and 0.8873 against 0.7647 for the best wrong one. Three
-independent routes clear it, so the task is not a single-path puzzle. Those numbers do not have to be
-taken on trust: solution/generate_data.py regenerates the shipped CSVs (seed 0, verified
-byte-identical by sha256) and solution/calibrate.py scores every route against the held-out
-packs, so a reviewer can reproduce the separation directly. Both sit in solution/, which is
-absent from the agent image, so shipping them cannot leak the labels.
+The capacity column has the extrapolation problem. Every field pack has more cycles than
+any teardown pack — 150-600 in training against 850-1700 to be scored — so anything that
+partitions feature space cannot leave the range it was fitted on. On the shipped instance
+gradient boosting scores -0.08, random forest -0.19 and KNN -0.64, and no amount of tuning
+moves them, because in-range cross-validation never shows the problem. Fade is
+diffusion-limited, so capacity tracks the square root of cycles, and the duty drivers scale
+the fade rate rather than shifting it, which puts them in multiplicatively: raw linear
+reaches 0.14, sqrt with interactions 0.62 and the log-rate form 0.66, against a ceiling of
+0.67 set by the irreducible pack-to-pack effect. The bar is 0.55.
 
-The data is synthetic, generated from a diffusion-limited fade model with per-pack noise,
-but the shape it reproduces is the one that makes this hard in practice: a teardown cohort
-is small, expensive and biased towards packs pulled early, so it never spans the cycle
-range of the fleet still running. Battery and reliability analytics engineers at
-fleet-leasing operators and second-life battery firms do exactly this — size a replacement
-schedule from a thin bench-tested cohort — and the extrapolation gap is the standing
-hazard in that job, not an artefact of the generator.
+The replacement column is the harder half, and a solution can get the capacity column
+perfectly right and still fail it. Two packs with identical spec sheets do not fade
+identically, and the SPREAD of that difference is itself a function of duty — cell imbalance
+and hot spots grow with heat and fast charging. So the margin a pack needs ahead of its 80%
+crossing is not one number; it is a function of the same columns the rate is. A solution
+that fits the mean correctly and treats the spread as a single pooled figure gets the
+fleet-wide count into range (7.6% on the shipped seed, inside the 7-13.5% band) and lands at
+2.2% in the gentlest third against a floor of 6% — it buys a uniform safety margin that is
+far too generous on gently used packs and too thin on hard-charged ones. That is the
+intended failure, and it is the one an agent that has understood only the first half will
+produce. Sizing a margin also requires noticing that the obvious estimator is biased: a
+teardown rate estimate is (100-capacity)/sqrt(cycles), so bench error is divided by a small
+number at low cycles and inflates the apparent spread exactly where the true spread is
+smallest.
+
+Calibrated over 14 generator seeds with solution/calibrate.py, which a reviewer can run.
+Two deliberately unlike correct routes pass on every seed — a parametric maximum-likelihood
+fit of the spread, and a non-parametric empirical quantile read off duty bins — so this is
+not a single-path puzzle. Four wrong routes fail on every seed, including two tuned on the
+withheld truth until the fleet-wide count lands exactly on target, which only the stratified
+bands reject. The shipped seed is the tightest of the 14 for the reference route, not the
+most comfortable one.
+
+The data is synthetic but the shape is the real one: a teardown cohort is small, expensive
+and biased towards packs pulled early, so it never spans the cycle range of the fleet still
+running, and warranty exposure is decided by the tail of the fade distribution rather than
+its middle. Reliability engineers at fleet-leasing operators and second-life battery firms
+size replacement schedules exactly this way.
 """
 
 solution_explanation = """
-The reference (solution/solve.sh) writes src/main.rs and runs the Cargo project. It
-regresses capacity on sqrt(cycles) together with the stress drivers and, critically, those
-drivers multiplied by sqrt(cycles) — chemistry, temperature, depth of discharge and
-fast-charge share each scaling the fade rate — using smartcore's LinearRegression, and
-clamps output to 0-100. It scores 0.9827 against the bench results with the bar at 0.88, and 0.9790 on the
-highest-cycle quarter against that band's bar of 0.87.
+The reference (solution/solve.sh) drops in src/main.rs and runs the Cargo project. It fits
+log(fade rate) by ordinary least squares on chemistry, temperature, depth of discharge and
+fast-charge share, which gives the capacity column directly as 100 - rate*sqrt(cycles). It
+then fits the residual scale as its own log-linear function of fast-charge share and heat by
+maximum likelihood — Newton steps on sum(2*Zg + r^2*exp(-2*Zg)), three parameters, small
+enough to hand-roll — and schedules each pack off the 90th percentile of its own fade-rate
+distribution rather than the median. On the shipped instance that scores R2 0.664 against
+the bench results, a fleet-wide late rate of 9.43%, and 8.55 / 9.65 / 10.10% across the
+three duty thirds.
 """
 
 verification_explanation = """
@@ -82,45 +96,45 @@ one the agent can read the answers out of, or whose test file it can rewrite bef
 reads it. The build runs in its own session, and its entire process group is torn down, then
 every process the build user still owns is swept, before pytest runs and before the reward
 is written — so nothing the agent started is alive during grading and no double-forked child
-can rewrite the reward after it is computed. /logs is left to Harbor, which owns it; the
-reward is simply written there last, once nothing hostile is running. Root alone runs pytest
-and decides the reward from its exit status, and the shipped export is left read-only to the
-build user. Verified by cheat arms — crates that read either copy of the labels, one that
-overwrites test_outputs.py, one that writes reward.txt directly — each of which compiles and
-then fails on permissions, scoring 0.
+can rewrite the reward after it is computed. pytest runs with the working directory off the
+import path, so agent code that writes into /app cannot shadow the pytest module itself and
+no-op the suite. /logs is left to Harbor, which owns it; the reward is simply written there
+last, once nothing hostile is running. Root alone runs pytest and decides the reward from its
+exit status, and the shipped export is left read-only to the build user. Verified by cheat
+arms — crates that read either copy of the labels, one that overwrites test_outputs.py, one
+that writes reward.txt directly, one that plants an /app/pytest.py shadow — each of which
+compiles and then fails, scoring 0.
 
-tests/test_outputs.py then runs seven checks: the shipped export is unaltered (sha256), the
-schema is exactly pack_id,capacity_pct, coverage of the field packs is one-to-one, values
-are numeric and within 0-100, predictions are a real spread rather than a constant, R2
-against tests/golden/test_labels.csv reaches 0.88, and that same R2 recomputed over only the
-highest-cycle quarter of the batch reaches 0.87. That first bar sits between the strongest
-wrong approach and the weakest correct one, both established by sweeping each route across six
-generator seeds: the best a wrong method achieves is 0.8217 (a tuned linear/boosted blend)
-and the weakest passing route is 0.9242, with the threshold frozen against the tightest seed.
+tests/test_outputs.py runs nine checks: the shipped export is unaltered (sha256), the schema
+is exactly pack_id,capacity_pct,replace_cycle, coverage of the field packs is one-to-one,
+capacities are numeric and within 0-100, replacement cycles are finite and positive, neither
+column is a repeated constant, R2 against the withheld bench results reaches 0.55, the share
+of packs whose recommendation falls after they had already dropped through 80% of nameplate
+lands within 7-13.5% fleet-wide, and that same share lands within 6-14.5% inside each third
+of the fleet by fast-charge share.
 
-The high-cycle bar exists because an aggregate R2 is dominated by the field packs nearest the
-training range, so a fade curve with the wrong exponent can drift badly at 1700 cycles and
-still post a respectable overall number. The band is the 450 field packs with the most cycles
-(1474-1700), fixed by sorting on (cycles, pack_id) so the split cannot shift between runs, and
-membership is derived from the shipped export after re-checking its sha256 rather than from
-anything the agent's crate can steer. On the shipped seed the same three routes clear both
-bars - sqrt-with-interactions 0.9790, the high-cycle-half refit 0.9790, and the log-fade route
-0.8873 - while the strongest wrong route reaches only 0.7647, so the second bar narrows the
-gap without closing off any route the first one admits.
-Only pytest is installed, so the CSV reading and the R2 come from the standard library.
+Both coverage bands are two-sided, so a schedule that replaces everything far too early
+fails as surely as one that runs late. The thirds are fixed by sorting the shipped export on
+(fast_charge_pct, pack_id) and cutting into three equal counts, after re-checking that
+export's sha256 — membership must not be steerable by the crate that is about to be rebuilt
+in the same container. The bands themselves were placed by sweeping every route across 14
+seeds (solution/calibrate.py): at 2000 packs per third the binomial standard deviation is
+0.67 points, the two correct routes sit at least 2.6 SD inside the nearest edge on every
+seed, and the four wrong routes sit at least 2.9 SD outside. Only pytest is installed, so
+the CSV reading and the arithmetic come from the standard library.
 """
 
 relevant_experience = """
 I authored the fleet predictive-maintenance task that was accepted into the previous benchmark
 edition, and this one is built on the harness and the calibration method I developed for it.
 That method is the part I would point at: grant every wrong approach its best possible
-adversary — tuned variants, blends, aggregate features — sweep them across several generated
-seeds, and only then place the threshold between the strongest wrong answer and the weakest
-correct one. Here that meant establishing that a half-and-half linear and boosted blend is the
-best a wrong method can do at 0.8217, which is well above the naive routes and would have
-quietly broken the task had I not swept for it. I also built the Rust/smartcore side of the
-harness, including the parts of that library that behave differently from their Python
-equivalents and have to be worked around by hand.
+adversary, sweep them across many generated seeds, and only then place a threshold — and
+report the separation in units of the sampling noise, so a bar that is really a coin flip
+cannot be mistaken for a bar. Here that meant giving the wrong routes access to the withheld
+truth and letting them tune until the headline number was exactly on target, which is what
+established that the fleet-wide count alone cannot carry the task and the stratified bands
+have to. I also built the Rust/smartcore side of the harness, including hand-rolling the
+maximum-likelihood fit that has no equivalent in that library.
 """
 
 [verifier]
@@ -132,10 +146,14 @@ environment_mode = "separate"
 
 [agent]
 # Solved offline by design: the crates are pre-fetched and pinned in Cargo.lock, and
-# network access would let the agent fetch a survival/ML library instead of
+# network access would let the agent fetch a distribution-fitting library instead of
 # implementing the fit, which is the work being measured.
 network_mode = "no-network"
-timeout_sec = 3600
+# 2 hours. There are two models to get right here, not one, and the second needs a
+# likelihood fit hand-rolled in a language with no statistics library — the sibling task
+# that shipped a single-model version of this workload had both agent runs time out at 60
+# minutes with src/main.rs still a stub. Task requirements: floor 1800, ceiling 18000.
+timeout_sec = 7200
 
 [environment]
 # Required "public" on every task, offline ones included: the image is built and the

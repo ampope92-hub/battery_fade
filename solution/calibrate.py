@@ -1,156 +1,169 @@
-"""Calibration sweep for battery_fade — provenance for review, not part of the solve.
+"""Scores every route this task can be attempted by, against the bars the verifier applies.
 
-Scores every modelling route against the held-out packs, which is where the numbers in
-task.toml's difficulty_explanation come from: the best wrong route reaches R2 0.8217, the
-weakest correct one 0.9242, and the 0.88 bar was frozen between them against the tightest of
-six seeds. Run it on any seed to reproduce that separation.
+`python solution/calibrate.py` sweeps the default 14 generator seeds; pass seeds as arguments
+to look at one. Needs numpy and pandas, and never runs inside the task container.
 
-    python solution/calibrate.py 0
+What it is for: the bars in tests/test_outputs.py are only defensible if the correct routes
+clear them and the plausible wrong ones do not, on more than the one seed that shipped. Each
+route is scored on BOTH graded axes, so the interaction is visible — every route here gets
+the capacity column equally right, and they separate only on the replacement schedule.
 
-Not executed by solve.sh and never present in the agent's environment.
+Routes A and B are correct and deliberately unlike each other: A models the spread
+parametrically by maximum likelihood, B never assumes a shape and reads an empirical
+quantile off duty bins. C is the near-miss the whole second axis exists to catch — the right
+mean model with the spread treated as one pooled number. D schedules off the median crossing
+with no margin at all. E and F are the gaming attacks: both are tuned on the WITHHELD truth
+until the fleet-wide count lands exactly on the target, which is why only the stratified
+bands reject them.
 """
 import sys
 
+import generate_data as G
 import numpy as np
 import pandas as pd
-from generate_data import make_fleet
-from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.metrics import r2_score
-from sklearn.neighbors import KNeighborsRegressor
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
-BASE = ["cycles", "avg_temp_c", "depth_of_discharge", "fast_charge_pct",
-        "cell_count", "pack_age_days"]
+THRESHOLD, DROP = 80.0, 20.0
+Z90 = 1.2815515655446004
+
+R2_BAR = 0.55
+FLEET = (7.0, 13.5)     # fleet-wide late rate, %
+BAND = (6.0, 14.5)      # per-tercile late rate, %
 
 
-def dummies(df):
-    return pd.get_dummies(df.chemistry, prefix="chem").astype(float)
+def r2(y, p):
+    return 1 - ((y - p) ** 2).sum() / ((y - y.mean()) ** 2).sum()
 
 
-def raw(df):
-    return pd.concat([df[BASE].reset_index(drop=True), dummies(df).reset_index(drop=True)], axis=1)
+def design(df):
+    """Drivers of the log fade rate — the same information the agent is given."""
+    X = pd.DataFrame({
+        "temp": df.avg_temp_c - 28.0,
+        "dod": df.depth_of_discharge - 0.65,
+        "fast": df.fast_charge_pct,
+        "lfp": (df.chemistry == "lfp").astype(float),
+        "nca": (df.chemistry == "nca").astype(float),
+    })
+    X.insert(0, "one", 1.0)
+    return X.to_numpy()
 
 
-def sqrt_feats(df, interactions):
-    """sqrt(cycles) in place of cycles; optionally scaled by the stress drivers."""
-    d = df.reset_index(drop=True)
-    s = np.sqrt(d.cycles.to_numpy())
-    out = pd.DataFrame({"sqrt_cycles": s})
-    for c in ["avg_temp_c", "depth_of_discharge", "fast_charge_pct", "cell_count", "pack_age_days"]:
-        out[c] = d[c].to_numpy()
-    ch = dummies(d)
-    for c in ch.columns:
-        out[c] = ch[c].to_numpy()
-    if interactions == "chem":
-        for c in ch.columns:
-            out[f"s_{c}"] = s * ch[c].to_numpy()
-        return out
-    if interactions:
-        for c in ch.columns:
-            out[f"s_{c}"] = s * ch[c].to_numpy()
-        out["s_temp"] = s * d.avg_temp_c.to_numpy()
-        out["s_dod"] = s * d.depth_of_discharge.to_numpy()
-        out["s_fast"] = s * d.fast_charge_pct.to_numpy()
+def duty_design(df):
+    """Drivers of the pack-to-pack spread around that rate."""
+    return np.column_stack([
+        np.ones(len(df)),
+        df.fast_charge_pct.to_numpy(),
+        np.maximum(0.0, df.avg_temp_c.to_numpy() - 28.0) / 10.0,
+    ])
+
+
+def fit_mean(tr):
+    rate = np.clip((100.0 - tr.capacity_pct.to_numpy()) / np.sqrt(tr.cycles.to_numpy()), 1e-6, None)
+    y = np.log(rate)
+    X = design(tr)
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    return beta, y - X @ beta
+
+
+def fit_log_sigma(tr, resid):
+    """MLE for log(sigma) = Z@g under resid ~ N(0, sigma_i^2). Newton on
+    sum(2*Z@g + resid^2 * exp(-2*Z@g)).
+
+    Regressing log|resid| on duty is the obvious first pass and it biases the gentle end:
+    a rate estimate is (100-capacity)/sqrt(cycles), so bench error is divided by a small
+    number at low cycles and inflates the apparent spread exactly where it is smallest.
+    """
+    Z = duty_design(tr)
+    g = np.zeros(Z.shape[1])
+    g[0] = np.log(resid.std())
+    for _ in range(200):
+        w = resid ** 2 * np.exp(-2.0 * (Z @ g))
+        grad = 2.0 * Z.T @ (1.0 - w)
+        H = 4.0 * (Z * w[:, None]).T @ Z + 1e-9 * np.eye(Z.shape[1])
+        step = np.linalg.solve(H, grad)
+        g -= step
+        if np.max(np.abs(step)) < 1e-11:
+            break
+    return g
+
+
+def bands(te):
+    """Exactly the rule tests/test_outputs.py applies: order by (fast_charge_pct, pack_id),
+    cut into three equal counts. Tie-safe and not steerable by row order."""
+    order = np.lexsort((te.pack_id.to_numpy(), te.fast_charge_pct.to_numpy()))
+    lab = np.empty(len(te), dtype=object)
+    n = len(order)
+    for rank, idx in enumerate(order):
+        lab[idx] = ("lowest", "middle", "highest")[min(rank * 3 // n, 2)]
+    return lab
+
+
+def late_rates(te, rec, lab):
+    late = np.asarray(rec, dtype=float) > te._true_cross.to_numpy()
+    return late.mean() * 100, {b: late[lab == b].mean() * 100 for b in ("lowest", "middle", "highest")}
+
+
+def routes(tr, te, lab):
+    beta, resid = fit_mean(tr)
+    base = np.exp(design(te) @ beta)
+    cap = 100.0 - base * np.sqrt(te.cycles.to_numpy())
+    out = {}
+
+    s_hat = np.exp(duty_design(te) @ fit_log_sigma(tr, resid))
+    out["A. duty-dependent spread, MLE (reference)"] = (cap, (DROP / (base * np.exp(Z90 * s_hat))) ** 2)
+
+    edges = np.quantile(tr.fast_charge_pct.to_numpy(), np.linspace(0, 1, 7)[1:-1])
+    btr = np.digitize(tr.fast_charge_pct.to_numpy(), edges)
+    bte = np.digitize(te.fast_charge_pct.to_numpy(), edges)
+    emp = np.array([np.quantile(resid[btr == b], 0.90) for b in range(len(edges) + 1)])
+    out["B. empirical duty bins (correct)"] = (cap, (DROP / (base * np.exp(emp[bte]))) ** 2)
+
+    out["C. pooled spread (near miss)"] = (cap, (DROP / (base * np.exp(Z90 * resid.std()))) ** 2)
+    out["D. median crossing, no margin"] = (cap, (DROP / base) ** 2)
+
+    def tuned(seed_rec, lo, hi):
+        """Scale until the FLEET-wide count lands on the 10% target, using the truth."""
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            if late_rates(te, seed_rec * mid if np.ndim(seed_rec) else np.full(len(te), mid), lab)[0] > 10.0:
+                hi = mid
+            else:
+                lo = mid
+        return (lo + hi) / 2
+
+    pt = (DROP / base) ** 2
+    out["E. scaled mean, tuned on truth"] = (cap, pt * tuned(pt, 0.01, 3.0))
+    out["F. one number, tuned on truth"] = (cap, np.full(len(te), tuned(1.0, 100.0, 40000.0)))
     return out
 
 
-def log_feats(df):
-    d = df.reset_index(drop=True)
-    out = raw(d).copy()
-    out["cycles"] = np.log(d.cycles.to_numpy())
-    return out
-
-
-def run(name, xtr, ytr, xte, yte, model):
-    model.fit(xtr, ytr)
-    pred = model.predict(xte)
-    print(f"  {name:<42s} R2 {r2_score(yte, pred):8.4f}   RMSE {np.sqrt(((yte-pred)**2).mean()):6.2f}")
-    return r2_score(yte, pred)
-
-
-def main(seed):
-    df = make_fleet(seed)
-    tr, te = df[~df.is_test], df[df.is_test]
-    ytr, yte = tr.capacity_pct.to_numpy(), te.capacity_pct.to_numpy()
-    print(f"seed {seed}: train {len(tr)}, test {len(te)}")
-
-    print(" WRONG — cannot leave the training range")
-    wrong = [
-        run("HistGradientBoosting (defaults)", raw(tr), ytr, raw(te), yte,
-            HistGradientBoostingRegressor(random_state=0)),
-        run("HistGradientBoosting (tuned deep)", raw(tr), ytr, raw(te), yte,
-            HistGradientBoostingRegressor(max_iter=600, learning_rate=0.05,
-                                          max_leaf_nodes=63, random_state=0)),
-        run("RandomForest", raw(tr), ytr, raw(te), yte,
-            RandomForestRegressor(n_estimators=300, random_state=0, n_jobs=-1)),
-        run("KNN (k=10)", raw(tr), ytr, raw(te), yte,
-            make_pipeline(StandardScaler(), KNeighborsRegressor(n_neighbors=10))),
-        run("GBM on sqrt-transformed cycles", sqrt_feats(tr, False), ytr,
-            sqrt_feats(te, False), yte, HistGradientBoostingRegressor(random_state=0)),
-    ]
-
-    print(" PARTIAL — extrapolates, wrong functional form")
-    partial = [
-        run("linear, raw cycles", raw(tr), ytr, raw(te), yte, LinearRegression()),
-        run("ridge, raw cycles", raw(tr), ytr, raw(te), yte,
-            make_pipeline(StandardScaler(), Ridge(alpha=1.0))),
-        run("poly2 on raw features", raw(tr), ytr, raw(te), yte,
-            make_pipeline(PolynomialFeatures(2), LinearRegression())),
-        run("0.5*linear + 0.5*GBM blend", raw(tr), ytr, raw(te), yte, Blend()),
-    ]
-
-    print(" CORRECT — sqrt/log form, extrapolates with the right slope")
-    correct = [
-        run("linear on sqrt(cycles)", sqrt_feats(tr, False), ytr,
-            sqrt_feats(te, False), yte, LinearRegression()),
-        run("linear on log(cycles)", log_feats(tr), ytr, log_feats(te), yte, LinearRegression()),
-        run("linear on sqrt(cycles) + interactions", sqrt_feats(tr, True), ytr,
-            sqrt_feats(te, True), yte, LinearRegression()),
-    ]
-    print(" ALTERNATIVE CORRECT ROUTES")
-    alt = [
-        run("log(fade) ~ log(cycles) + covariates", raw(tr), ytr, raw(te), yte, LogFade()),
-        run("linear on sqrt, chemistry interaction only", sqrt_feats(tr, "chem"), ytr,
-            sqrt_feats(te, "chem"), yte, LinearRegression()),
-        run("linear on sqrt+inter, high-cycle half only", sqrt_feats(tr[tr.cycles > 325], True),
-            tr[tr.cycles > 325].capacity_pct.to_numpy(), sqrt_feats(te, True), yte,
-            LinearRegression()),
-    ]
-    print(f"\n  alt min     {min(alt):.4f}")
-    print(f"\n  wrong max   {max(wrong):.4f}")
-    print(f"  partial max {max(partial):.4f}")
-    print(f"  correct min {min(correct):.4f}  max {max(correct):.4f}")
-
-
-class LogFade:
-    """Fade is multiplicative, so regress log(100 - capacity) on log(cycles)."""
-
-    def fit(self, x, y):
-        self.x_cols = list(x.columns)
-        xx = x.copy()
-        xx["cycles"] = np.log(xx["cycles"].to_numpy())
-        self.m = LinearRegression().fit(xx, np.log(np.clip(100.0 - y, 0.01, None)))
-        return self
-
-    def predict(self, x):
-        xx = x.copy()
-        xx["cycles"] = np.log(xx["cycles"].to_numpy())
-        return 100.0 - np.exp(self.m.predict(xx))
-
-
-class Blend:
-    """A plausible hedge: average a linear model and a boosted tree."""
-
-    def fit(self, x, y):
-        self.a = LinearRegression().fit(x, y)
-        self.b = HistGradientBoostingRegressor(random_state=0).fit(x, y)
-        return self
-
-    def predict(self, x):
-        return 0.5 * self.a.predict(x) + 0.5 * self.b.predict(x)
+def run(seed):
+    d = G.make_fleet(seed)
+    tr, te = d[~d.is_test].copy(), d[d.is_test].copy()
+    lab = bands(te)
+    y = te.capacity_pct.to_numpy()
+    rows = []
+    for name, (cap, rec) in routes(tr, te, lab).items():
+        fleet, per = late_rates(te, rec, lab)
+        rows.append(dict(
+            seed=seed, route=name, r2=r2(y, cap), fleet=fleet, **per,
+            passes=(r2(y, cap) >= R2_BAR and FLEET[0] <= fleet <= FLEET[1]
+                    and all(BAND[0] <= v <= BAND[1] for v in per.values())),
+        ))
+    return rows
 
 
 if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 0)
+    seeds = [int(a) for a in sys.argv[1:]] or list(range(14))
+    df = pd.DataFrame([r for s in seeds for r in run(s)])
+    pd.set_option("display.width", 220)
+    print(f"bars: R2 >= {R2_BAR}   fleet late {FLEET}%   per-third late {BAND}%\n")
+    print(df.groupby("route").agg(
+        r2_min=("r2", "min"), r2_max=("r2", "max"),
+        fleet_min=("fleet", "min"), fleet_max=("fleet", "max"),
+        lowest_min=("lowest", "min"), lowest_max=("lowest", "max"),
+        highest_min=("highest", "min"), highest_max=("highest", "max"),
+        n_pass=("passes", "sum"), n=("passes", "size"),
+    ).to_string(float_format=lambda v: f"{v:.2f}"))
+    sd = np.sqrt(0.10 * 0.90 / (len(df) and 2000)) * 100
+    print(f"\nbinomial SD per third at p=10%, n=2000: {sd:.2f} pp — a bar closer than about"
+          f"\n3 SD to any route it has to separate is a coin flip, not a bar.")
