@@ -38,8 +38,8 @@ N_BANDS = 3
 THRESHOLD_PCT = 80.0
 
 # frozen at task-build time; the shipped export must not be altered
-TEST_FEATURES_SHA = "3057b258630f005818f0f38ee3dee952f9179f9e22b74b30df95331538a492d1"
-TRAIN_SHA = "389df1daa5b626fc4c3020ec985db64d137d703e1d40306ba73b63158c4e9813"
+TEST_FEATURES_SHA = "ad723c01d7375c3612f8b79d3f9f6d9ffa83fec8efef81942f8f1c2f9f0e1c0b"
+TRAIN_SHA = "28690060085a37419ee57a985b4167e89433d5d1d3e33079599bb67fcdbb4cb1"
 
 
 def _read_csv(path):

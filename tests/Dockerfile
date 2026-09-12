@@ -24,7 +24,8 @@ COPY --from=rust /usr/local/cargo /usr/local/cargo
 COPY --from=rust /usr/local/rustup /usr/local/rustup
 
 # Verifier tooling, pinned. Nothing is installed at trial time.
-RUN pip install --no-cache-dir pytest==8.4.1 pytest-json-ctrf==0.3.5
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --require-hashes --no-deps -r /tmp/requirements.txt && rm -f /tmp/requirements.txt
 
 # test.sh rebuilds and runs the agent's crate, so agent-authored code executes in this
 # image — and this image holds the answer key. That code runs as `runner`, never root:

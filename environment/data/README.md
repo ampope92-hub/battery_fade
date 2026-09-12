@@ -15,6 +15,14 @@ depth_of_discharge  mean fraction of capacity drawn per cycle (BMS)
 fast_charge_pct     fraction of charges done on the fast charger (BMS)
 cell_count          cells in the pack
 pack_age_days       days since the pack entered service
+dc_resistance_mohm  pack DC internal resistance, milliohms. On teardown rows this is the
+                    bench rig figure, taken in the same session as the capacity test with
+                    the pack settled at 25 C. On field rows it is the last resistance the
+                    BMS logged in service, computed off whatever load step it last saw, at
+                    whatever temperature the pack was at.
+soh_pct             state of health, percent of nameplate. The BMS carries a running estimate
+                    from coulomb counting. On teardown rows the maintenance system overwrites
+                    that field with the bench result once the pack has been through the rig.
 capacity_pct        bench-measured capacity, percent of nameplate (teardown only)
 
 Cohorts
@@ -24,6 +32,10 @@ The teardown cohort is what came off the line during the first replacement wave,
 skews toward packs pulled early: warranty swaps, fleet refreshes, units returned with
 unrelated faults. The field export is everything still running. Bench capacity comes
 off a calibrated rig, good to about a percent.
+
+Both cohorts are pulled into one schema by the asset database, which fills each column from
+whichever system holds it for that pack — the bench records for units that have been through
+the rig, the telemetry stream for units still in service.
 
 Replacement policy
 ------------------

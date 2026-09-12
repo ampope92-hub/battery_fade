@@ -1,20 +1,23 @@
-"""Scores every route this task can be attempted by, against the bars the verifier applies.
+"""battery_fade — route sweep and bar validation. Run it beside the task:
 
-`python solution/calibrate.py` sweeps the default 14 generator seeds; pass seeds as arguments
-to look at one. Needs numpy and pandas, and never runs inside the task container.
+    python solution/calibrate.py            # 14 seeds
+    python solution/calibrate.py 5          # just the shipped instance
 
-What it is for: the bars in tests/test_outputs.py are only defensible if the correct routes
-clear them and the plausible wrong ones do not, on more than the one seed that shipped. Each
-route is scored on BOTH graded axes, so the interaction is visible — every route here gets
-the capacity column equally right, and they separate only on the replacement schedule.
+It never runs inside the task container; it reads only generate_data.py, so a reviewer can
+re-derive every number in task.toml rather than take it on trust. Needs numpy, pandas and
+(for the tree arms) scikit-learn.
 
-Routes A and B are correct and deliberately unlike each other: A models the spread
-parametrically by maximum likelihood, B never assumes a shape and reads an empirical
-quantile off duty bins. C is the near-miss the whole second axis exists to catch — the right
-mean model with the spread treated as one pooled number. D schedules off the median crossing
-with no margin at all. E and F are the gaming attacks: both are tuned on the WITHHELD truth
-until the fleet-wide count lands exactly on the target, which is why only the stratified
-bands reject them.
+Does the provenance trap actually deceive?
+
+Three things have to hold at once, and the third is the one v2 never had:
+
+  1. the HONEST route still clears both bars (the ceiling must not move);
+  2. every LEAK route fails at least one bar decisively;
+  3. an honest holdout built on train.csv alone RANKS THE LEAK ROUTES FIRST.
+
+(3) is the whole design. The v2 trials all built a low-cycle -> high-cycle split inside
+train and it told them the truth, so they converged. Here that same split is contaminated
+in every row, so it recommends the trap.
 """
 import sys
 
@@ -22,20 +25,13 @@ import generate_data as G
 import numpy as np
 import pandas as pd
 
-THRESHOLD, DROP = 80.0, 20.0
-Z90 = 1.2815515655446004
+THRESH, Z90 = 80.0, 1.2815515655446004
+DROP = 100.0 - THRESH
 
-R2_BAR = 0.55
-FLEET = (7.0, 13.5)     # fleet-wide late rate, %
-BAND = (6.0, 14.5)      # per-tercile late rate, %
+HONEST = ["temp", "dod", "fast", "lfp", "nca"]
 
 
-def r2(y, p):
-    return 1 - ((y - p) ** 2).sum() / ((y - y.mean()) ** 2).sum()
-
-
-def design(df):
-    """Drivers of the log fade rate — the same information the agent is given."""
+def design(df, extra=()):
     X = pd.DataFrame({
         "temp": df.avg_temp_c - 28.0,
         "dod": df.depth_of_discharge - 0.65,
@@ -43,127 +39,190 @@ def design(df):
         "lfp": (df.chemistry == "lfp").astype(float),
         "nca": (df.chemistry == "nca").astype(float),
     })
+    for e in extra:
+        if e == "res":
+            X["res"] = (df.dc_resistance_mohm - 50.0) / 10.0
+        elif e == "soh":
+            X["soh"] = (df.soh_pct - 90.0) / 10.0
     X.insert(0, "one", 1.0)
     return X.to_numpy()
 
 
-def duty_design(df):
-    """Drivers of the pack-to-pack spread around that rate."""
-    return np.column_stack([
-        np.ones(len(df)),
-        df.fast_charge_pct.to_numpy(),
-        np.maximum(0.0, df.avg_temp_c.to_numpy() - 28.0) / 10.0,
-    ])
-
-
-def fit_mean(tr):
+def fit_mean(tr, extra=()):
     rate = np.clip((100.0 - tr.capacity_pct.to_numpy()) / np.sqrt(tr.cycles.to_numpy()), 1e-6, None)
     y = np.log(rate)
-    X = design(tr)
+    X = design(tr, extra)
     beta, *_ = np.linalg.lstsq(X, y, rcond=None)
     return beta, y - X @ beta
 
 
-def fit_log_sigma(tr, resid):
-    """MLE for log(sigma) = Z@g under resid ~ N(0, sigma_i^2). Newton on
-    sum(2*Z@g + resid^2 * exp(-2*Z@g)).
+def duty_design(df):
+    return np.column_stack([np.ones(len(df)), df.fast_charge_pct.to_numpy(),
+                            np.maximum(0.0, df.avg_temp_c.to_numpy() - 28.0) / 10.0])
 
-    Regressing log|resid| on duty is the obvious first pass and it biases the gentle end:
-    a rate estimate is (100-capacity)/sqrt(cycles), so bench error is divided by a small
-    number at low cycles and inflates the apparent spread exactly where it is smallest.
-    """
-    Z = duty_design(tr)
-    g = np.zeros(Z.shape[1])
-    g[0] = np.log(resid.std())
+
+def fit_sigma(tr, resid):
+    Z = duty_design(tr); g = np.zeros(Z.shape[1]); g[0] = np.log(resid.std())
     for _ in range(200):
-        w = resid ** 2 * np.exp(-2.0 * (Z @ g))
+        w = resid**2 * np.exp(-2.0 * (Z @ g))
         grad = 2.0 * Z.T @ (1.0 - w)
         H = 4.0 * (Z * w[:, None]).T @ Z + 1e-9 * np.eye(Z.shape[1])
-        step = np.linalg.solve(H, grad)
-        g -= step
-        if np.max(np.abs(step)) < 1e-11:
-            break
+        step = np.linalg.solve(H, grad); g -= step
+        if np.max(np.abs(step)) < 1e-11: break
     return g
 
 
-def bands(te):
-    """Exactly the rule tests/test_outputs.py applies: order by (fast_charge_pct, pack_id),
-    cut into three equal counts. Tie-safe and not steerable by row order."""
-    order = np.lexsort((te.pack_id.to_numpy(), te.fast_charge_pct.to_numpy()))
-    lab = np.empty(len(te), dtype=object)
-    n = len(order)
-    for rank, idx in enumerate(order):
-        lab[idx] = ("lowest", "middle", "highest")[min(rank * 3 // n, 2)]
-    return lab
+def r2(y, p): return 1 - ((y - p) ** 2).sum() / ((y - y.mean()) ** 2).sum()
 
 
-def late_rates(te, rec, lab):
-    late = np.asarray(rec, dtype=float) > te._true_cross.to_numpy()
-    return late.mean() * 100, {b: late[lab == b].mean() * 100 for b in ("lowest", "middle", "highest")}
+def metrics(te, rec):
+    late = rec > te._true_cross.to_numpy()
+    band = pd.qcut(te.fast_charge_pct, 3, labels=["gentle", "mid", "hard"])
+    per = {b: late[(band == b).to_numpy()].mean() * 100 for b in ["gentle", "mid", "hard"]}
+    return late.mean() * 100, per
 
 
-def routes(tr, te, lab):
-    beta, resid = fit_mean(tr)
-    base = np.exp(design(te) @ beta)
-    cap = 100.0 - base * np.sqrt(te.cycles.to_numpy())
+def _rate_route(tr, te, extra):
+    """log-rate OLS on the given feature set, then the hetero-MLE schedule."""
+    beta, resid = fit_mean(tr, extra)
+    base_hat = np.exp(design(te, extra) @ beta)
+    cap = 100.0 - base_hat * np.sqrt(te.cycles.to_numpy())
+    s = np.exp(duty_design(te) @ fit_sigma(tr, resid))
+    return cap, (DROP / (base_hat * np.exp(Z90 * s))) ** 2
+
+
+def routes(tr, te):
     out = {}
+    out["1. honest log-rate + hetero MLE"] = _rate_route(tr, te, ())
+    out["2. leak: soh_pct shipped directly"] = (
+        te.soh_pct.to_numpy(),
+        (DROP / (np.clip((100.0 - te.soh_pct.to_numpy()), 0.05, None)
+                 / np.sqrt(te.cycles.to_numpy()) * np.exp(Z90 * 0.15))) ** 2)
+    out["3. leak: soh in the rate model"] = _rate_route(tr, te, ("soh",))
+    out["4. leak: resistance in the rate model"] = _rate_route(tr, te, ("res",))
+    out["5. leak: both in the rate model"] = _rate_route(tr, te, ("res", "soh"))
 
-    s_hat = np.exp(duty_design(te) @ fit_log_sigma(tr, resid))
-    out["A. duty-dependent spread, MLE (reference)"] = (cap, (DROP / (base * np.exp(Z90 * s_hat))) ** 2)
+    try:
+        from sklearn.ensemble import HistGradientBoostingRegressor as HGB
+        def tab(df, cols):
+            d = df[cols].copy()
+            d["chem"] = pd.Categorical(df.chemistry, G.CHEMS).codes
+            return d.to_numpy(float)
+        base = ["cycles", "avg_temp_c", "depth_of_discharge", "fast_charge_pct",
+                "cell_count", "pack_age_days"]
+        for nm, cols in [("6. GBM honest cols", base),
+                         ("7. GBM kitchen sink (leaks in)",
+                          base + ["dc_resistance_mohm", "soh_pct"])]:
+            m = HGB(random_state=0).fit(tab(tr, cols), tr.capacity_pct.to_numpy())
+            cap = m.predict(tab(te, cols))
+            rt = np.clip((100.0 - cap) / np.sqrt(te.cycles.to_numpy()), 1e-6, None)
+            out[nm] = (cap, (DROP / (rt * np.exp(Z90 * 0.15))) ** 2)
+    except ImportError:
+        pass
+    return out
 
-    edges = np.quantile(tr.fast_charge_pct.to_numpy(), np.linspace(0, 1, 7)[1:-1])
-    btr = np.digitize(tr.fast_charge_pct.to_numpy(), edges)
-    bte = np.digitize(te.fast_charge_pct.to_numpy(), edges)
-    emp = np.array([np.quantile(resid[btr == b], 0.90) for b in range(len(edges) + 1)])
-    out["B. empirical duty bins (correct)"] = (cap, (DROP / (base * np.exp(emp[bte]))) ** 2)
 
-    out["C. pooled spread (near miss)"] = (cap, (DROP / (base * np.exp(Z90 * resid.std()))) ** 2)
-    out["D. median crossing, no margin"] = (cap, (DROP / base) ** 2)
+def holdout_rank(tr):
+    """What an HONEST validation built on train.csv alone reports.
 
-    def tuned(seed_rec, lo, hi):
-        """Scale until the FLEET-wide count lands on the 10% target, using the truth."""
-        for _ in range(60):
-            mid = (lo + hi) / 2
-            if late_rates(te, seed_rec * mid if np.ndim(seed_rec) else np.full(len(te), mid), lab)[0] > 10.0:
-                hi = mid
-            else:
-                lo = mid
-        return (lo + hi) / 2
+    Fit on the low-cycle half, score on the high-cycle half -- exactly the split the v2
+    trials built to guard against the extrapolation trap. If the trap works, this ranks the
+    leak routes ABOVE the honest one.
+    """
+    cut = tr.cycles.median()
+    a, b = tr[tr.cycles <= cut].copy(), tr[tr.cycles > cut].copy()
+    y = b.capacity_pct.to_numpy()
+    res = {}
+    for nm, extra in [("honest", ()), ("+soh", ("soh",)), ("+res", ("res",)),
+                      ("+both", ("res", "soh"))]:
+        beta, _ = fit_mean(a, extra)
+        cap = 100.0 - np.exp(design(b, extra) @ beta) * np.sqrt(b.cycles.to_numpy())
+        res[nm] = r2(y, cap)
+    res["soh direct"] = r2(y, b.soh_pct.to_numpy())
+    return res
 
-    pt = (DROP / base) ** 2
-    out["E. scaled mean, tuned on truth"] = (cap, pt * tuned(pt, 0.01, 3.0))
-    out["F. one number, tuned on truth"] = (cap, np.full(len(te), tuned(1.0, 100.0, 40000.0)))
+
+
+
+# ---------------------------------------------------------------------------------------
+# Per-seed pass/fail with binomial SD margins. A band edge closer than ~3 SD to any route is
+# not a bar, it is a coin flip. Coverage is a binomial count over 2000 packs per tercile, so
+# SD = sqrt(p(1-p)/n) ~ 0.67pp at p=0.10.
+# ---------------------------------------------------------------------------------------
+R2_BAR = 0.55
+FLEET = (7.0, 13.5)
+BAND = (6.0, 14.5)
+
+
+def extra_adversaries(tr, te):
+    """The attacks fleet_failures learned to grant: tuning on withheld truth, and
+    blend/smoothing rescues that can launder a leak back into a usable signal."""
+    out = {}
+    beta, resid = fit_mean(tr, ())
+    base_hat = np.exp(design(te, ()) @ beta)
+    pt = (DROP / base_hat) ** 2
+    lo, hi = 0.01, 3.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if metrics(te, pt * mid)[0] > 10.0: hi = mid
+        else: lo = mid
+    cap_h = 100.0 - base_hat * np.sqrt(te.cycles.to_numpy())
+    out["8. scaled mean TUNED ON TRUTH"] = (cap_h, pt * (lo + hi) / 2)
+
+    # blend the honest prediction with the leak columns -- the "keep a bit of it" rescue
+    bres, _ = fit_mean(tr, ("res",))
+    cap_r = 100.0 - np.exp(design(te, ("res",)) @ bres) * np.sqrt(te.cycles.to_numpy())
+    for w in (0.25, 0.5):
+        cap = (1 - w) * cap_h + w * cap_r
+        rt = np.clip((100.0 - cap) / np.sqrt(te.cycles.to_numpy()), 1e-6, None)
+        s = np.exp(duty_design(te) @ fit_sigma(tr, resid))
+        out[f"9. blend honest/res w={w}"] = (cap, (DROP / (rt * np.exp(Z90 * s))) ** 2)
+    cap_s = 0.5 * cap_h + 0.5 * te.soh_pct.to_numpy()
+    rt = np.clip((100.0 - cap_s) / np.sqrt(te.cycles.to_numpy()), 1e-6, None)
+    out["10. blend honest/soh w=0.5"] = (
+        cap_s, (DROP / (rt * np.exp(Z90 * np.exp(duty_design(te) @ fit_sigma(tr, resid))))) ** 2)
     return out
 
 
 def run(seed):
     d = G.make_fleet(seed)
     tr, te = d[~d.is_test].copy(), d[d.is_test].copy()
-    lab = bands(te)
     y = te.capacity_pct.to_numpy()
+    rr = routes(tr, te); rr.update(extra_adversaries(tr, te))
     rows = []
-    for name, (cap, rec) in routes(tr, te, lab).items():
-        fleet, per = late_rates(te, rec, lab)
-        rows.append(dict(
-            seed=seed, route=name, r2=r2(y, cap), fleet=fleet, **per,
-            passes=(r2(y, cap) >= R2_BAR and FLEET[0] <= fleet <= FLEET[1]
-                    and all(BAND[0] <= v <= BAND[1] for v in per.values())),
-        ))
-    return rows
+    for nm, (cap, rec) in rr.items():
+        fleet, per = metrics(te, np.clip(rec, 1, 1e7))
+        ok = (r2(y, cap) >= R2_BAR and FLEET[0] <= fleet <= FLEET[1]
+              and all(BAND[0] <= v <= BAND[1] for v in per.values()))
+        rows.append(dict(seed=seed, route=nm, R2=r2(y, cap), fleet=fleet, **per, PASS=ok))
+    return rows, holdout_rank(tr)
 
 
 if __name__ == "__main__":
     seeds = [int(a) for a in sys.argv[1:]] or list(range(14))
-    df = pd.DataFrame([r for s in seeds for r in run(s)])
-    pd.set_option("display.width", 220)
-    print(f"bars: R2 >= {R2_BAR}   fleet late {FLEET}%   per-third late {BAND}%\n")
-    print(df.groupby("route").agg(
-        r2_min=("r2", "min"), r2_max=("r2", "max"),
+    allrows, holds = [], []
+    for s in seeds:
+        r, h = run(s); allrows += r; holds.append(h)
+    df = pd.DataFrame(allrows); pd.set_option("display.width", 240)
+    g = df.groupby("route").agg(
+        R2_min=("R2", "min"), R2_max=("R2", "max"),
         fleet_min=("fleet", "min"), fleet_max=("fleet", "max"),
-        lowest_min=("lowest", "min"), lowest_max=("lowest", "max"),
-        highest_min=("highest", "min"), highest_max=("highest", "max"),
-        n_pass=("passes", "sum"), n=("passes", "size"),
-    ).to_string(float_format=lambda v: f"{v:.2f}"))
-    sd = np.sqrt(0.10 * 0.90 / (len(df) and 2000)) * 100
-    print(f"\nbinomial SD per third at p=10%, n=2000: {sd:.2f} pp — a bar closer than about"
-          f"\n3 SD to any route it has to separate is a coin flip, not a bar.")
+        worst_band=("gentle", "min"), n_pass=("PASS", "sum"), n=("PASS", "size"))
+    # worst band across all three, per route
+    g["band_lo"] = df.groupby("route")[["gentle", "mid", "hard"]].min().min(axis=1)
+    g["band_hi"] = df.groupby("route")[["gentle", "mid", "hard"]].max().max(axis=1)
+    g = g.drop(columns=["worst_band"])
+    print(f"=== {len(seeds)} seeds — bars R2>={R2_BAR}, fleet {FLEET}, thirds {BAND} ===")
+    print(g.to_string(float_format=lambda v: f"{v:7.3f}"))
+    sd = np.sqrt(0.10 * 0.90 / 2000) * 100
+    print(f"\nbinomial SD per tercile (n=2000, p=0.10): {sd:.2f} pp")
+    h = df[df.route.str.startswith("1.")]
+    print(f"honest route: R2 {h.R2.min():.3f}-{h.R2.max():.3f}  "
+          f"fleet {h.fleet.min():.2f}-{h.fleet.max():.2f}  "
+          f"worst band {df[df.route.str.startswith('1.')][['gentle','mid','hard']].min().min():.2f}"
+          f"-{df[df.route.str.startswith('1.')][['gentle','mid','hard']].max().max():.2f}")
+    print(f"  margin to nearest band edge: "
+          f"{(df[df.route.str.startswith('1.')][['gentle','mid','hard']].min().min()-BAND[0])/sd:.1f} SD low, "
+          f"{(BAND[1]-df[df.route.str.startswith('1.')][['gentle','mid','hard']].max().max())/sd:.1f} SD high")
+    print("\n=== TRAIN-ONLY HONEST HOLDOUT (mean over seeds) ===")
+    print(pd.DataFrame(holds).mean().to_string(float_format=lambda v: f"{v:.4f}"))

@@ -57,8 +57,9 @@ find /app/predictor/src -type f -exec touch {} +
 # Run the crate in its own session, so every process it spawns shares one process group that
 # can be torn down as a unit. A bare `runuser` leaves a double-forked child reparented to init
 # and still alive during grading, where it could rewrite reward.txt after the reward is
-# computed. The timeout bounds the build well inside the verifier's own timeout_sec.
-setsid timeout -k 30 1200 \
+# computed. [verifier].timeout_sec is the only bound on the build: a wall-clock wrapper
+# here can fail a slow but correct one.
+setsid \
   setpriv --clear-groups --no-new-privs --reuid runner --regid runner \
   bash -c 'cd /app/predictor && cargo run --release --offline' &
 BUILD_PID=$!

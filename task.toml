@@ -14,14 +14,44 @@ category = "ML"
 subcategory = "Training"
 tags = ["rust", "smartcore", "cargo", "regression", "heteroscedasticity", "decision-threshold"]
 languages = ["rust"]
-difficulty = "advanced"
+difficulty = "core"
 expert_time_estimate_hours = 10
 author_name = "anonymous"
 author_email = "anonymous"
 
 difficulty_explanation = """
-Two numbers are graded per pack and they fail for different reasons, which is what makes
-this more than a regression exercise.
+Two numbers are graded per pack, and before either can be fitted the export has to be read
+for what it is. Three things have to go right and they fail independently.
+
+The first is the export itself. train.csv is the teardown cohort and test_features.csv is
+the field cohort, and two columns carry the same name in both while coming from different
+instruments. dc_resistance_mohm is the bench rig's figure on teardown rows, taken in the
+same session as the capacity test with the pack settled at 25 C, and the BMS's last
+in-service estimate on field rows, taken at whatever temperature the pack was at. soh_pct is
+the BMS's coulomb-counting estimate, except on teardown rows, where the maintenance system
+has overwritten it with the bench result. So on the training rows soh_pct IS the label to
+within rounding, and resistance is very nearly a function of it; on the field rows neither
+is. The data dictionary states both of these as facts about where the numbers come from and
+draws no conclusion from them.
+
+What makes this the load-bearing difficulty is that no validation the agent can build will
+reveal it. Both columns are contaminated identically in every training row, at every cycle
+count, so the low-cycle-fit / high-cycle-score split — the natural guard against the
+extrapolation problem below, and the one every trial of the previous version built
+unprompted — scores the contaminated routes ABOVE the clean one: 0.78 with resistance in the
+design against 0.67 without it, and 0.97 for simply shipping soh_pct as the answer. Graded on
+the field cohort those same routes return 0.50 and -1.22 against a 0.55 bar, and their
+replacement schedules run 33.5% and 54.6% late against a 7-13.5% band. The agent's own
+honest measurement points at the trap, and it points harder the more carefully it is made.
+
+The way out is not a validation trick, because there is no held-out data that can price
+these columns. It is reading the dictionary and reasoning about the instruments: resistance
+rises as a cell degrades, the field cohort is far more degraded than the teardown cohort,
+and yet the field resistances read LOWER — because cell resistance falls with temperature
+and the field figures were never temperature-corrected. That contradiction is visible in the
+shipped data and is what the two columns are for.
+
+The other two are the modelling proper, and they fail for different reasons again.
 
 The capacity column has the extrapolation problem. Every field pack has more cycles than
 any teardown pack — 150-600 in training against 850-1700 to be scored — so anything that
@@ -48,7 +78,15 @@ teardown rate estimate is (100-capacity)/sqrt(cycles), so bench error is divided
 number at low cycles and inflates the apparent spread exactly where the true spread is
 smallest.
 
-Calibrated over 14 generator seeds with solution/calibrate.py, which a reviewer can run.
+On the shipped instance the reference scores 0.664 with a fleet-wide late rate of 9.43% and
+8.63/9.65/10.12% across the duty thirds. Every contaminated route fails 14 seeds out of 14,
+and so does the strongest gaming attack — a single factor tuned on the withheld truth, which
+hits the fleet-wide target exactly by construction and lands at 3.6% and 17.6% in the outer
+thirds. The reference sits 3.9 binomial SD inside the nearest band edge.
+
+Calibrated over 14 generator seeds with solution/calibrate.py, which a reviewer can run; it
+prints both the graded table and the train-only holdout ranking that the trap inverts.
+solution/generate_data.py regenerates all three CSVs byte for byte.
 Two deliberately unlike correct routes pass on every seed — a parametric maximum-likelihood
 fit of the spread, and a non-parametric empirical quantile read off duty bins — so this is
 not a single-path puzzle. Four wrong routes fail on every seed, including two tuned on the
@@ -119,9 +157,19 @@ fails as surely as one that runs late. The thirds are fixed by sorting the shipp
 export's sha256 — membership must not be steerable by the crate that is about to be rebuilt
 in the same container. The bands themselves were placed by sweeping every route across 14
 seeds (solution/calibrate.py): at 2000 packs per third the binomial standard deviation is
-0.67 points, the two correct routes sit at least 2.6 SD inside the nearest edge on every
-seed, and the four wrong routes sit at least 2.9 SD outside. Only pytest is installed, so
-the CSV reading and the arithmetic come from the standard library.
+0.67 points, the correct routes sit at least 2.6 SD inside the nearest edge on every seed,
+and every wrong route sits outside on all 14. Only pytest is installed, so the CSV reading
+and the arithmetic come from the standard library.
+
+Two further arms check that the graded bars actually discriminate, rather than only that
+cheating is blocked. Both are the reference solution changed in exactly one place, and both
+are run through the real verifier container. One estimates the pack-to-pack spread as a
+single pooled number instead of a function of duty: it gets the capacity column and the
+fleet-wide count right and still scores 0, failing only the stratified bands, which is what
+makes the replacement column a second axis rather than a restatement of the first. The other
+adds dc_resistance_mohm to the log-rate design — the single change an honest holdout built on
+train.csv recommends, because it improves that holdout from 0.67 to 0.78. It also scores 0.
+If either had scored 1 the corresponding axis would not exist.
 """
 
 relevant_experience = """
